@@ -536,8 +536,9 @@ typedef struct zset {
 } zset;
 
 typedef struct {
+    dict *dict;
 	zset counts;
-	zset expires;
+	zskiplist *expires;
 	double currentExpire;
 } eset;
 
@@ -737,7 +738,8 @@ static void slaveofCommand(redisClient *c);
 static void debugCommand(redisClient *c);
 static void msetCommand(redisClient *c);
 static void msetnxCommand(redisClient *c);
-static void taddCommand(redisClient *c);
+static void eaddCommand(redisClient *c);
+static void eexpireCommand(redisClient *c);
 static void zaddCommand(redisClient *c);
 static void zincrbyCommand(redisClient *c);
 static void zrangeCommand(redisClient *c);
@@ -825,7 +827,8 @@ static struct redisCommand readonlyCommandTable[] = {
     {"sdiff",sdiffCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,-1,1},
     {"sdiffstore",sdiffstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,2,-1,1},
     {"smembers",sinterCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
-    {"tadd",taddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
+    {"eadd",eaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
+    {"eexpire",eexpireCommand,3,REDIS_CMD_INLINE,NULL,1,1,1},
     {"zadd",zaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zrem",zremCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
@@ -3096,13 +3099,10 @@ static robj *createZsetObject(void) {
 
 static robj *createEsetObject(void) {
     eset *es = zmalloc(sizeof(*es));
-	/* We're pretty much making two zsees */
+
     es->counts.dict = dictCreate(&zsetDictType,NULL);
     es->counts.zsl = zslCreate();
-
-    es->expires.dict = dictCreate(&zsetDictType,NULL);
-    es->expires.zsl = zslCreate();
-
+    es->expires = zslCreate();
 	es->currentExpire = 0.0;
 
     return createObject(REDIS_ESET,es);
@@ -3143,11 +3143,9 @@ static void freeZsetObject(robj *o) {
 static void freeEsetObject(robj *o) {
     eset *es = o->ptr;
 
-    dictRelease(es->expires.dict);
-    zslFree(es->expires.zsl);
-
-    dictRelease(es->counts.dict);
+    zslFree(es->expires);
     zslFree(es->counts.zsl);
+    dictRelease(es->counts.dict);
 
     zfree(es);
 }
@@ -6158,27 +6156,8 @@ zskiplistNode* zslistTypeGetElementByRank(zskiplist *zsl, unsigned long rank) {
 /* This generic command implements both ZADD and ZINCRBY.
  * scoreval is the score if the operation is a ZADD (doincrement == 0) or
  * the increment if the operation is a ZINCRBY (doincrement == 1). */
-static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, int doincrement) {
-    robj *zsetobj;
-    zset *zs;
+static int zaddInnerGenericCommand(redisClient *c, zset *zs, robj *ele, double scoreval, int doincrement, int noreply) {
     double *score;
-
-    if (isnan(scoreval)) {
-        addReplySds(c,sdsnew("-ERR provide score is Not A Number (nan)\r\n"));
-        return;
-    }
-
-    zsetobj = lookupKeyWrite(c->db,key);
-    if (zsetobj == NULL) {
-        zsetobj = createZsetObject();
-        dbAdd(c->db,key,zsetobj);
-    } else {
-        if (zsetobj->type != REDIS_ZSET) {
-            addReply(c,shared.wrongtypeerr);
-            return;
-        }
-    }
-    zs = zsetobj->ptr;
 
     /* Ok now since we implement both ZADD and ZINCRBY here the code
      * needs to handle the two different conditions. It's all about setting
@@ -6202,7 +6181,7 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
             /* Note that we don't need to check if the zset may be empty and
              * should be removed here, as we can only obtain Nan as score if
              * there was already an element in the sorted set. */
-            return;
+            return REDIS_ERR;
         }
     } else {
         *score = scoreval;
@@ -6216,10 +6195,12 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
         zslInsert(zs->zsl,*score,ele);
         incrRefCount(ele); /* added to skiplist */
         server.dirty++;
-        if (doincrement)
-            addReplyDouble(c,*score);
-        else
-            addReply(c,shared.cone);
+		if (!noreply) {
+			if (doincrement)
+				addReplyDouble(c,*score);
+			else
+				addReply(c,shared.cone);
+		}
     } else {
         dictEntry *de;
         double *oldscore;
@@ -6242,11 +6223,39 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
         } else {
             zfree(score);
         }
-        if (doincrement)
-            addReplyDouble(c,*score);
-        else
-            addReply(c,shared.czero);
+		if (!noreply) {
+			if (doincrement)
+				addReplyDouble(c,*score);
+			else
+				addReply(c,shared.czero);
+		}
     }
+
+	return REDIS_OK;
+}
+
+static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, int doincrement) {
+    robj *zsetobj;
+    zset *zs;
+
+    if (isnan(scoreval)) {
+        addReplySds(c,sdsnew("-ERR provide score is Not A Number (nan)\r\n"));
+        return;
+    }
+
+    zsetobj = lookupKeyWrite(c->db,key);
+    if (zsetobj == NULL) {
+        zsetobj = createZsetObject();
+        dbAdd(c->db,key,zsetobj);
+    } else {
+        if (zsetobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+    }
+    zs = zsetobj->ptr;
+
+	zaddInnerGenericCommand(c, zs, ele, scoreval, doincrement, 0);
 }
 
 static void zaddCommand(redisClient *c) {
@@ -6819,6 +6828,107 @@ static void zrankCommand(redisClient *c) {
 static void zrevrankCommand(redisClient *c) {
     zrankGenericCommand(c, 1);
 }
+
+/* ESet stuff */
+/* TODO use integers for the count! */
+
+static void eaddGenericCommand(redisClient *c, robj *key, robj *ele, double expireval) {
+    robj *esetobj;
+    eset *es;
+    double *expire;
+	
+    esetobj = lookupKeyWrite(c->db,key);
+    if (esetobj == NULL) {
+        esetobj = createEsetObject();
+        dbAdd(c->db,key,esetobj);
+    } else {
+        if (esetobj->type != REDIS_ESET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+    }
+    es = esetobj->ptr;
+
+	/* If the expire is below our current expire, we can exit early */
+    if (expireval < es->currentExpire) {
+        return;
+    }
+
+    if (isnan(expireval)) {
+        addReplySds(c,sdsnew("-ERR provide expire is Not A Number (nan)\r\n"));
+        return;
+    }
+
+	/* Now add the value to the zset  or increment it by one*/
+
+	if (zaddInnerGenericCommand(c, &es->counts, ele, 1.0, 1, 0) == REDIS_ERR)
+		return;
+
+    expire = zmalloc(sizeof(double));
+	*expire = expireval;
+
+
+	/* the zsl for expires can (and will) contain duplicates */
+	zslInsert(es->expires,*expire,ele);
+	incrRefCount(ele); /* added to expires skiplist */
+}
+
+static void eaddCommand(redisClient *c) {
+    double expireval;
+
+    if (getDoubleFromObjectOrReply(c, c->argv[2], &expireval, NULL) != REDIS_OK) return;
+    eaddGenericCommand(c,c->argv[1],c->argv[3],expireval);
+}
+
+static void eexpireCommand(redisClient *c) {
+    robj *esetobj;
+	eset *es;
+    double expireval;
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+	zskiplist *zsl;
+	unsigned long removed = 0;
+	int i;
+
+    if (getDoubleFromObjectOrReply(c, c->argv[2], &expireval, NULL) != REDIS_OK) return;
+
+    if ((esetobj = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,esetobj,REDIS_ESET)) return;
+
+	es = esetobj->ptr;
+
+	/* if the expireval isn't increasing, just return */
+	if (expireval < es->currentExpire)
+		return;
+
+	zsl = es->expires;
+
+	/* We're just deleting from the beginning */
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        update[i] = x;
+    }
+
+	/* now we have to get expired keys */
+    x = x->forward[0];
+
+	/* Are we going to be able to expire any? If the tail is a higher value than */
+	while (x && x->score < expireval) {
+		zskiplistNode *next = x->forward[0];
+        zslDeleteNode(zsl, x, update);
+
+		if (zaddInnerGenericCommand(c, &es->counts, x->obj, -1.0, 1, 1) == REDIS_ERR)
+			return;
+
+		/* TODO add code to delete the fiend if it gets down to 0 */
+        zslFreeNode(x);
+
+		x = next;
+		removed += 1;
+	}
+	addReplyUlong(c, removed);
+}
+
 
 
 /* ========================= Hashes utility functions ======================= */
@@ -11159,8 +11269,7 @@ static void computeDatasetDigest(unsigned char *final) {
 				computeZsetDigest(digest, buf, zs);
             } else if (o->type == REDIS_ESET) {
                 eset *es = o->ptr;
-				computeZsetDigest(digest, buf, &es->expires);
-				computeZsetDigest(digest, buf, &es->counts);
+				/* TODO implement me */
             } else if (o->type == REDIS_HASH) {
                 hashTypeIterator *hi;
                 robj *obj;
