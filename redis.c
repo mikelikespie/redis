@@ -740,6 +740,7 @@ static void msetCommand(redisClient *c);
 static void msetnxCommand(redisClient *c);
 static void eaddCommand(redisClient *c);
 static void eexpireCommand(redisClient *c);
+static void etopkCommand(redisClient *c);
 static void zaddCommand(redisClient *c);
 static void zincrbyCommand(redisClient *c);
 static void zrangeCommand(redisClient *c);
@@ -829,6 +830,7 @@ static struct redisCommand readonlyCommandTable[] = {
     {"smembers",sinterCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
     {"eadd",eaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"eexpire",eexpireCommand,3,REDIS_CMD_INLINE,NULL,1,1,1},
+    {"etopk",etopkCommand,-3,REDIS_CMD_INLINE,NULL,1,1,1},
     {"zadd",zaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zrem",zremCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
@@ -6880,6 +6882,55 @@ static void eaddCommand(redisClient *c) {
     eaddGenericCommand(c,c->argv[1],c->argv[3],expireval);
 }
 
+
+static void etopkCommand(redisClient *c) {
+	long k;
+	long i;
+    robj *esetobj;
+	eset *es;
+	robj *lenobj = NULL;
+	zskiplistNode *x;
+    int withcounts = 0;
+	int badsyntax = 0;
+
+    if (getLongFromObjectOrReply(c, c->argv[2], &k, NULL) != REDIS_OK) return;
+
+    if (c->argc == 4) {
+        if (strcasecmp(c->argv[c->argc-1]->ptr,"withcounts") == 0)
+            withcounts = 1;
+        else
+            badsyntax = 1;
+    } else if (c->argc != 3) {
+		badsyntax = 1;
+	}
+	
+    if (badsyntax) {
+        addReplySds(c,
+            sdsnew("-ERR wrong number of arguments for ETOPK\r\n"));
+        return;
+    }
+	
+    if ((esetobj = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,esetobj,REDIS_ESET)) return;
+
+	es = esetobj->ptr;
+	x = es->counts.zsl->tail;
+
+	lenobj = createObject(REDIS_STRING,NULL);
+	addReply(c,lenobj);
+	decrRefCount(lenobj);
+
+	for (i = 0; i < k && x; i++, x = x->backward) {
+		addReplyBulk(c,x->obj);
+		if (withcounts) 
+			addReplyDouble(c, x->score);
+	}
+
+	lenobj->ptr = sdscatprintf(sdsempty(),"*%lu\r\n",
+			withcounts ? (i*2) : i);
+
+}
+
 static void eexpireCommand(redisClient *c) {
     robj *esetobj;
 	eset *es;
@@ -6887,6 +6938,7 @@ static void eexpireCommand(redisClient *c) {
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
 	zskiplist *zsl;
 	unsigned long removed = 0;
+	unsigned long deleted = 0;
 	int i;
 
     if (getDoubleFromObjectOrReply(c, c->argv[2], &expireval, NULL) != REDIS_OK) return;
@@ -6926,6 +6978,13 @@ static void eexpireCommand(redisClient *c) {
 		x = next;
 		removed += 1;
 	}
+
+	/* now we have to delete the nodes from the dict that have  vals of 0 */
+	/* Since we might have rounding error, delete everything between -.5 and .5. */
+    deleted = zslDeleteRangeByScore(es->counts.zsl,-0.5,0.5,es->counts.dict);
+    if (htNeedsResize(es->counts.dict)) dictResize(es->counts.dict);
+    if (dictSize(es->counts.dict) == 0) dbDelete(c->db,c->argv[1]);
+
 	addReplyUlong(c, removed);
 }
 
