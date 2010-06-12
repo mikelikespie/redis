@@ -121,7 +121,7 @@
 #define REDIS_SET 2
 #define REDIS_ZSET 3
 #define REDIS_HASH 4
-#define REDIS_TSET 6
+#define REDIS_ESET 6
 #define REDIS_VMPOINTER 8
 
 /* Objects encoding. Some kind of objects like Strings and Hashes can be
@@ -535,6 +535,12 @@ typedef struct zset {
     zskiplist *zsl;
 } zset;
 
+typedef struct {
+	zset counts;
+	zset expires;
+	double currentExpire;
+} eset;
+
 /* Our shared "common" objects */
 
 #define REDIS_SHARED_INTEGERS 10000
@@ -835,8 +841,6 @@ static struct redisCommand readonlyCommandTable[] = {
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zrank",zrankCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
     {"zrevrank",zrevrankCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
-	{"tincr",tincrCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
-	{"tget",tgetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"hset",hsetCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"hsetnx",hsetnxCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"hget",hgetCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
@@ -3090,14 +3094,18 @@ static robj *createZsetObject(void) {
     return createObject(REDIS_ZSET,zs);
 }
 
-static robj *createTsetObject(void) {
-    tset *ts = zmalloc(siteof(*ts));
-	/* We're pretty much making two zsets */
-    ts->counts->dict = dictCreate(&zsetDictType,NULL);
-    ts->counts->tsl = zslCreate();
-    ts->expires->dict = dictCreate(&zsetDictType,NULL);
-    ts->expires->tsl = zslCreate();
-    return createObject(REDIS_TSET,ts);
+static robj *createEsetObject(void) {
+    eset *es = zmalloc(sizeof(*es));
+	/* We're pretty much making two zsees */
+    es->counts.dict = dictCreate(&zsetDictType,NULL);
+    es->counts.zsl = zslCreate();
+
+    es->expires.dict = dictCreate(&zsetDictType,NULL);
+    es->expires.zsl = zslCreate();
+
+	es->currentExpire = 0.0;
+
+    return createObject(REDIS_ESET,es);
 }
 
 
@@ -3130,6 +3138,18 @@ static void freeZsetObject(robj *o) {
     dictRelease(zs->dict);
     zslFree(zs->zsl);
     zfree(zs);
+}
+
+static void freeEsetObject(robj *o) {
+    eset *es = o->ptr;
+
+    dictRelease(es->expires.dict);
+    zslFree(es->expires.zsl);
+
+    dictRelease(es->counts.dict);
+    zslFree(es->counts.zsl);
+
+    zfree(es);
 }
 
 static void freeHashObject(robj *o) {
@@ -3184,6 +3204,7 @@ static void decrRefCount(void *obj) {
         case REDIS_SET: freeSetObject(o); break;
         case REDIS_ZSET: freeZsetObject(o); break;
         case REDIS_HASH: freeHashObject(o); break;
+		case REDIS_ESET: freeEsetObject(o); break;
         default: redisPanic("Unknown object type"); break;
         }
         if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
@@ -5819,15 +5840,6 @@ static void sdiffCommand(redisClient *c) {
 
 static void sdiffstoreCommand(redisClient *c) {
     sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],REDIS_OP_DIFF);
-}
-
-/* ============================= TSet commands ============================== */
-static void taddCommand(redisClient *c) {
-    int update;
-	robj** orig_argv = c.orig_argv;
-	
-
-    robj *;
 }
 
 /* ==================================== ZSets =============================== */
@@ -11055,6 +11067,24 @@ static void mixObjectDigest(unsigned char *digest, robj *o) {
     decrRefCount(o);
 }
 
+static void computeZsetDigest(unsigned char digest[20], char buf[128], zset *zs) {
+	dictIterator *di = dictGetIterator(zs->dict);
+	dictEntry *de;
+
+	while((de = dictNext(di)) != NULL) {
+		robj *eleobj = dictGetEntryKey(de);
+		double *score = dictGetEntryVal(de);
+		unsigned char eledigest[20];
+
+		snprintf(buf,sizeof(buf),"%.17g",*score);
+		memset(eledigest,0,20);
+		mixObjectDigest(eledigest,eleobj);
+		mixDigest(eledigest,buf,strlen(buf));
+		xorDigest(digest,eledigest,20);
+	}
+	dictReleaseIterator(di);
+}
+
 /* Compute the dataset digest. Since keys, sets elements, hashes elements
  * are not ordered, we use a trick: every aggregate digest is the xor
  * of the digests of their elements. This way the order will not change
@@ -11126,21 +11156,11 @@ static void computeDatasetDigest(unsigned char *final) {
                 dictReleaseIterator(di);
             } else if (o->type == REDIS_ZSET) {
                 zset *zs = o->ptr;
-                dictIterator *di = dictGetIterator(zs->dict);
-                dictEntry *de;
-
-                while((de = dictNext(di)) != NULL) {
-                    robj *eleobj = dictGetEntryKey(de);
-                    double *score = dictGetEntryVal(de);
-                    unsigned char eledigest[20];
-
-                    snprintf(buf,sizeof(buf),"%.17g",*score);
-                    memset(eledigest,0,20);
-                    mixObjectDigest(eledigest,eleobj);
-                    mixDigest(eledigest,buf,strlen(buf));
-                    xorDigest(digest,eledigest,20);
-                }
-                dictReleaseIterator(di);
+				computeZsetDigest(digest, buf, zs);
+            } else if (o->type == REDIS_ESET) {
+                eset *es = o->ptr;
+				computeZsetDigest(digest, buf, &es->expires);
+				computeZsetDigest(digest, buf, &es->counts);
             } else if (o->type == REDIS_HASH) {
                 hashTypeIterator *hi;
                 robj *obj;
