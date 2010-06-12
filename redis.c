@@ -536,7 +536,6 @@ typedef struct zset {
 } zset;
 
 typedef struct {
-    dict *dict;
     zset counts;
     zskiplist *expires;
     double currentExpire;
@@ -3862,7 +3861,7 @@ static int rdbSaveObject(FILE *fp, robj *o) {
         dictIterator *di = dictGetIterator(es->counts.dict);
         dictEntry *de;
 
-        if (rdbSaveLen(fp,dictSize(es->dict)) == -1) return -1;
+        if (rdbSaveLen(fp,dictSize(es->counts.dict)) == -1) return -1;
         while((de = dictNext(di)) != NULL) {
             robj *eleobj = dictGetEntryKey(de);
             double *cost = dictGetEntryVal(de);
@@ -3872,8 +3871,7 @@ static int rdbSaveObject(FILE *fp, robj *o) {
         }
         dictReleaseIterator(di);
 
-        /* Are we going to be able to expire any? If the tail is a higher value than */
-        for (x = es->expires->header; x; x = x->forward[0]) {
+        for (x = es->expires->header->forward[0]; x; x = x->forward[0]) {
             if (rdbSaveStringObject(fp,x->obj) == -1) return -1;
             if (rdbSaveDoubleValue(fp,x->score) == -1) return -1;
         }
