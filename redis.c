@@ -3210,8 +3210,8 @@ static void decrRefCount(void *obj) {
         case REDIS_LIST: freeListObject(o); break;
         case REDIS_SET: freeSetObject(o); break;
         case REDIS_ZSET: freeZsetObject(o); break;
-        case REDIS_HASH: freeHashObject(o); break;
         case REDIS_ESET: freeEsetObject(o); break;
+        case REDIS_HASH: freeHashObject(o); break;
         default: redisPanic("Unknown object type"); break;
         }
         if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
@@ -3855,6 +3855,29 @@ static int rdbSaveObject(FILE *fp, robj *o) {
             if (rdbSaveDoubleValue(fp,*score) == -1) return -1;
         }
         dictReleaseIterator(di);
+    } else if (o->type == REDIS_ESET) {
+        /* Save a set value */
+        eset *es = o->ptr;
+        zskiplistNode *x;
+        dictIterator *di = dictGetIterator(es->counts.dict);
+        dictEntry *de;
+
+        if (rdbSaveLen(fp,dictSize(es->dict)) == -1) return -1;
+        while((de = dictNext(di)) != NULL) {
+            robj *eleobj = dictGetEntryKey(de);
+            double *cost = dictGetEntryVal(de);
+
+            if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
+            if (rdbSaveDoubleValue(fp,*cost) == -1) return -1;
+        }
+        dictReleaseIterator(di);
+
+        /* Are we going to be able to expire any? If the tail is a higher value than */
+        for (x = es->expires->header; x; x = x->forward[0]) {
+            if (rdbSaveStringObject(fp,x->obj) == -1) return -1;
+            if (rdbSaveDoubleValue(fp,x->score) == -1) return -1;
+        }
+
     } else if (o->type == REDIS_HASH) {
         /* Save a hash value */
         if (o->encoding == REDIS_ENCODING_ZIPMAP) {
@@ -4267,6 +4290,43 @@ static robj *rdbLoadObject(int type, FILE *fp) {
             if (rdbLoadDoubleValue(fp,score) == -1) return NULL;
             dictAdd(zs->dict,ele,score);
             zslInsert(zs->zsl,*score,ele);
+            incrRefCount(ele); /* added to skiplist */
+        }
+    } else if (type == REDIS_ESET) {
+        /* Read list/set value */
+        size_t esetlen;
+        unsigned int i;
+        zset *zs;
+        eset *es;
+        zskiplist *zsl;
+
+        if ((esetlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+        o = createEsetObject();
+        es = (eset*)o->ptr;
+        zs = &es->counts;
+
+        /* Load every single element of the list/set */
+        for(i = 0; i < esetlen; i++) {
+            robj *ele;
+            double *score = zmalloc(sizeof(double));
+
+            if ((ele = rdbLoadEncodedStringObject(fp)) == NULL) return NULL;
+            ele = tryObjectEncoding(ele);
+            if (rdbLoadDoubleValue(fp,score) == -1) return NULL;
+            dictAdd(zs->dict,ele,score);
+            zslInsert(zs->zsl,*score,ele);
+            incrRefCount(ele); /* added to skiplist */
+        }
+
+        /* Load every single element of the list/set */
+        for(i = 0; i < esetlen; i++) {
+            robj *ele;
+            double expiration;
+
+            if ((ele = rdbLoadEncodedStringObject(fp)) == NULL) return NULL;
+            ele = tryObjectEncoding(ele);
+            if (rdbLoadDoubleValue(fp,&expiration) == -1) return NULL;
+            zslInsert(zsl,expiration,ele);
             incrRefCount(ele); /* added to skiplist */
         }
     } else if (type == REDIS_HASH) {
@@ -6941,7 +7001,6 @@ static void zrevrankCommand(redisClient *c) {
 static void eaddGenericCommand(redisClient *c, robj *key, robj *ele, double expireval) {
     robj *esetobj;
     eset *es;
-    double *expire;
     
     esetobj = lookupKeyWrite(c->db,key);
     if (esetobj == NULL) {
@@ -6970,12 +7029,8 @@ static void eaddGenericCommand(redisClient *c, robj *key, robj *ele, double expi
     if (zaddInnerGenericCommand(c, &es->counts, ele, 1.0, 1, 0) == REDIS_ERR)
         return;
 
-    expire = zmalloc(sizeof(double));
-    *expire = expireval;
-
-
     /* the zsl for expires can (and will) contain duplicates */
-    zslInsert(es->expires,*expire,ele);
+    zslInsert(es->expires,expireval,ele);
     incrRefCount(ele); /* added to expires skiplist */
 }
 
@@ -7088,6 +7143,8 @@ static void eexpireCommand(redisClient *c) {
     deleted = zslDeleteRangeByScore(es->counts.zsl,-0.5,0.5,es->counts.dict);
     if (htNeedsResize(es->counts.dict)) dictResize(es->counts.dict);
     if (dictSize(es->counts.dict) == 0) dbDelete(c->db,c->argv[1]);
+
+    server.dirty += removed;
 
     addReplyUlong(c, removed);
 }
@@ -7724,6 +7781,7 @@ static void sortCommand(redisClient *c) {
     case REDIS_LIST: vectorlen = listTypeLength(sortval); break;
     case REDIS_SET: vectorlen =  dictSize((dict*)sortval->ptr); break;
     case REDIS_ZSET: vectorlen = dictSize(((zset*)sortval->ptr)->dict); break;
+    case REDIS_ESET: vectorlen = dictSize(((eset*)sortval->ptr)->counts.dict); break;
     default: vectorlen = 0; redisPanic("Bad SORT type"); /* Avoid GCC warning */
     }
     vector = zmalloc(sizeof(redisSortObject)*vectorlen);
@@ -9901,6 +9959,7 @@ static double computeObjectSwappability(robj *o) {
     dict *d;
     struct dictEntry *de;
     int z;
+    int e;
 
     if (minage <= 0) return 0;
     switch(o->type) {
@@ -9928,18 +9987,24 @@ static double computeObjectSwappability(robj *o) {
         break;
     case REDIS_SET:
     case REDIS_ZSET:
+    case REDIS_ESET:
         z = (o->type == REDIS_ZSET);
-        d = z ? ((zset*)o->ptr)->dict : o->ptr;
+        e = (o->type == REDIS_ESET);
+        if (z) d = ((zset*)o->ptr)->dict;
+        else if (e) d = ((eset*)o->ptr)->counts.dict;
+        else d = o->ptr;
 
         asize = sizeof(dict)+(sizeof(struct dictEntry*)*dictSlots(d));
         if (z) asize += sizeof(zset)-sizeof(dict);
+        else if (e) asize += sizeof(eset)-sizeof(dict);
+
         if (dictSize(d)) {
             de = dictGetRandomKey(d);
             ele = dictGetEntryKey(de);
             elesize = (ele->encoding == REDIS_ENCODING_RAW) ?
                             (sizeof(*o)+sdslen(ele->ptr)) : sizeof(*o);
             asize += (sizeof(struct dictEntry)+elesize)*dictSize(d);
-            if (z) asize += sizeof(zskiplistNode)*dictSize(d);
+            if (z || e) asize += (e ? 2 : 1) * sizeof(zskiplistNode)*dictSize(d);
         }
         break;
     case REDIS_HASH:
@@ -11426,7 +11491,7 @@ static void computeDatasetDigest(unsigned char *final) {
                 zset *zs = o->ptr;
                 computeZsetDigest(digest, buf, zs);
             } else if (o->type == REDIS_ESET) {
-                eset *es = o->ptr;
+                /*eset *es = o->ptr; */
                 /* TODO implement me */
             } else if (o->type == REDIS_HASH) {
                 hashTypeIterator *hi;
