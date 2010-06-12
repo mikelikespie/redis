@@ -3860,6 +3860,7 @@ static int rdbSaveObject(FILE *fp, robj *o) {
         zskiplistNode *x;
         dictIterator *di = dictGetIterator(es->counts.dict);
         dictEntry *de;
+        int i;
 
         if (rdbSaveLen(fp,dictSize(es->counts.dict)) == -1) return -1;
         while((de = dictNext(di)) != NULL) {
@@ -3869,12 +3870,18 @@ static int rdbSaveObject(FILE *fp, robj *o) {
             if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
             if (rdbSaveDoubleValue(fp,*cost) == -1) return -1;
         }
+
         dictReleaseIterator(di);
 
+        
+        if (rdbSaveLen(fp,es->expires->length) == -1) return -1;
+        i = 0;
         for (x = es->expires->header->forward[0]; x; x = x->forward[0]) {
             if (rdbSaveStringObject(fp,x->obj) == -1) return -1;
             if (rdbSaveDoubleValue(fp,x->score) == -1) return -1;
+            i++;
         }
+        redisAssert(i == es->expires->length);
 
     } else if (o->type == REDIS_HASH) {
         /* Save a hash value */
@@ -4292,19 +4299,24 @@ static robj *rdbLoadObject(int type, FILE *fp) {
         }
     } else if (type == REDIS_ESET) {
         /* Read list/set value */
-        size_t esetlen;
+        size_t esetcountlen;
+        size_t esetexpireslen;
         unsigned int i;
         zset *zs;
         eset *es;
         zskiplist *zsl;
 
-        if ((esetlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+        if ((esetcountlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
         o = createEsetObject();
         es = (eset*)o->ptr;
         zs = &es->counts;
 
+        zsl = zslCreate();
+        es->expires = zsl;
+
+
         /* Load every single element of the list/set */
-        for(i = 0; i < esetlen; i++) {
+        for(i = 0; i < esetcountlen; i++) {
             robj *ele;
             double *score = zmalloc(sizeof(double));
 
@@ -4316,8 +4328,10 @@ static robj *rdbLoadObject(int type, FILE *fp) {
             incrRefCount(ele); /* added to skiplist */
         }
 
+        if ((esetexpireslen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+
         /* Load every single element of the list/set */
-        for(i = 0; i < esetlen; i++) {
+        for(i = 0; i < esetexpireslen; i++) {
             robj *ele;
             double expiration;
 
