@@ -7168,8 +7168,6 @@ static void eexpireCommand(redisClient *c) {
 
     es->total_count -= removed;
 
-    redisAssert(es->total_count >= 0);
-
     /* now we have to delete the nodes from the dict that have  vals of 0 */
     /* Since we might have rounding error, delete everything between -.5 and .5. */
     deleted = zslDeleteRangeByScore(es->counts.zsl,-0.5,0.5,es->counts.dict);
