@@ -7042,6 +7042,8 @@ static void eaddGenericCommand(redisClient *c, robj *key, robj *ele, double expi
     if (zaddInnerGenericCommand(c, &es->counts, ele, 1.0, 1, 0) == REDIS_ERR)
         return;
 
+	es->total_count += 1;
+
     /* the zsl for expires can (and will) contain duplicates */
     zslInsert(es->expires,expireval,ele);
     incrRefCount(ele); /* added to expires skiplist */
