@@ -536,9 +536,9 @@ typedef struct zset {
 } zset;
 
 typedef struct {
+    unsigned long total_count;
     zset counts;
     zskiplist *expires;
-    double currentExpire;
 } eset;
 
 /* Our shared "common" objects */
@@ -742,6 +742,8 @@ static void msetCommand(redisClient *c);
 static void msetnxCommand(redisClient *c);
 static void eaddCommand(redisClient *c);
 static void eexpireCommand(redisClient *c);
+static void ecardCommand(redisClient *c);
+static void etotalcountCommand(redisClient *c);
 static void etopkCommand(redisClient *c);
 static void zaddCommand(redisClient *c);
 static void zincrbyCommand(redisClient *c);
@@ -835,6 +837,8 @@ static struct redisCommand readonlyCommandTable[] = {
     {"smembers",sinterCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
     {"eadd",eaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"eexpire",eexpireCommand,3,REDIS_CMD_INLINE,NULL,1,1,1},
+    {"etotalcount",etotalcountCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
+    {"ecard",ecardCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
     {"etopk",etopkCommand,-3,REDIS_CMD_INLINE,NULL,1,1,1},
     {"zadd",zaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
@@ -3111,7 +3115,7 @@ static robj *createEsetObject(void) {
     es->counts.dict = dictCreate(&zsetDictType,NULL);
     es->counts.zsl = zslCreate();
     es->expires = zslCreate();
-    es->currentExpire = 0.0;
+    es->total_count = 0;
 
     return createObject(REDIS_ESET,es);
 }
@@ -3860,7 +3864,7 @@ static int rdbSaveObject(FILE *fp, robj *o) {
         zskiplistNode *x;
         dictIterator *di = dictGetIterator(es->counts.dict);
         dictEntry *de;
-        int i;
+        unsigned int i;
 
         if (rdbSaveLen(fp,dictSize(es->counts.dict)) == -1) return -1;
         while((de = dictNext(di)) != NULL) {
@@ -3873,7 +3877,6 @@ static int rdbSaveObject(FILE *fp, robj *o) {
 
         dictReleaseIterator(di);
 
-        
         if (rdbSaveLen(fp,es->expires->length) == -1) return -1;
         i = 0;
         for (x = es->expires->header->forward[0]; x; x = x->forward[0]) {
@@ -4313,7 +4316,7 @@ static robj *rdbLoadObject(int type, FILE *fp) {
 
         zsl = zslCreate();
         es->expires = zsl;
-
+        es->total_count = 0;
 
         /* Load every single element of the list/set */
         for(i = 0; i < esetcountlen; i++) {
@@ -4326,6 +4329,7 @@ static robj *rdbLoadObject(int type, FILE *fp) {
             dictAdd(zs->dict,ele,score);
             zslInsert(zs->zsl,*score,ele);
             incrRefCount(ele); /* added to skiplist */
+            es->total_count += *score;
         }
 
         if ((esetexpireslen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
@@ -7027,9 +7031,6 @@ static void eaddGenericCommand(redisClient *c, robj *key, robj *ele, double expi
     es = esetobj->ptr;
 
     /* If the expire is below our current expire, we can exit early */
-    if (expireval < es->currentExpire) {
-        return;
-    }
 
     if (isnan(expireval)) {
         addReplySds(c,sdsnew("-ERR provide expire is Not A Number (nan)\r\n"));
@@ -7102,12 +7103,32 @@ static void etopkCommand(redisClient *c) {
 
 }
 
-static void eexpireCommand(redisClient *c) {
+static void etotalcountCommand(redisClient *c) {
     robj *esetobj;
+    
+    if ((esetobj = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,esetobj,REDIS_ESET)) return;
+
+    addReplyUlong(c, ((eset*)esetobj->ptr)->total_count);
+}
+
+static void ecardCommand(redisClient *c) {
+    robj *o;
     eset *es;
+
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,o,REDIS_ESET)) return;
+
+    es = o->ptr;
+    addReplyUlong(c,es->counts.zsl->length);
+}
+
+static void eexpireCommand(redisClient *c) {
     double expireval;
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
     zskiplist *zsl;
+    robj *esetobj;
+    eset *es;
     unsigned long removed = 0;
     unsigned long deleted = 0;
     int i;
@@ -7119,14 +7140,9 @@ static void eexpireCommand(redisClient *c) {
 
     es = esetobj->ptr;
 
-    /* if the expireval isn't increasing, just return */
-    if (expireval < es->currentExpire)
-        return;
-
     zsl = es->expires;
 
     /* We're just deleting from the beginning */
-
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
         update[i] = x;
@@ -7149,6 +7165,10 @@ static void eexpireCommand(redisClient *c) {
         x = next;
         removed += 1;
     }
+
+    es->total_count -= removed;
+
+    redisAssert(es->total_count >= 0);
 
     /* now we have to delete the nodes from the dict that have  vals of 0 */
     /* Since we might have rounding error, delete everything between -.5 and .5. */
