@@ -9409,6 +9409,8 @@ static int rewriteAppendOnlyFile(char *filename) {
             }
             expiretime = getExpire(db,&key);
 
+			/* TODO XXX add eset */
+
             /* Save the key and associated value */
             if (o->type == REDIS_STRING) {
                 /* Emit a SET command */
