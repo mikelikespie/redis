@@ -512,13 +512,13 @@ void zremrangebyrankCommand(redisClient *c) {
     server.dirty += deleted;
     addReplyLongLong(c, deleted);
 }
-static void zsetdCommand(redisClient *c) {
+
+void zsetdCommand(redisClient *c) {
     robj *zsetobj, *key;
     zset *zs;
-    unsigned long rank;
     double lambda, startTime;
 
-    key = c->argv[1]
+    key = c->argv[1];
     if (getDoubleFromObjectOrReply(c, c->argv[2], &startTime, NULL) != REDIS_OK) return;
     if (getDoubleFromObjectOrReply(c, c->argv[3], &lambda, NULL) != REDIS_OK) return;
 
@@ -542,10 +542,54 @@ static void zsetdCommand(redisClient *c) {
             return;
         }
     }
+
     zs = zsetobj->ptr;
-    zs->lambda = (float)lambda;
     zs->t = startTime;
     zs->dt = 0.0;
+    zs->lambda = (float)lambda;
+
+    addReply(c, shared.ok);
+}
+
+void zinfodCommand(redisClient *c) {
+    robj *o;
+    zset *zs;
+
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,o,REDIS_ZSET)) return;
+
+    zs = o->ptr;
+
+    /* Return the result in form of a multi-bulk reply */
+    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",
+        6));
+    addReplyBulkCString(c, "t");
+	addReplyDouble(c,zs->t);
+    addReplyBulkCString(c, "dt");
+	addReplyDouble(c,zs->dt);
+    addReplyBulkCString(c, "lambda");
+	addReplyDouble(c,(double)zs->lambda);
+}
+
+void zsettCommand(redisClient *c) {
+    robj *o;
+    zset *zs;
+	double t;
+
+    if (getDoubleFromObjectOrReply(c, c->argv[2], &t, NULL) != REDIS_OK) return;
+
+    if (isnan(t)) {
+        addReplySds(c,sdsnew("-ERR provided t is not a number (nan)\r\n"));
+        return;
+    }
+
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,o,REDIS_ZSET)) return;
+
+    zs = o->ptr;
+	zs->dt = t - zs->t;
+
+	addReply(c,shared.czero);
 }
 
 typedef struct {

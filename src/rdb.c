@@ -277,6 +277,9 @@ int rdbSaveObject(FILE *fp, robj *o) {
         dictIterator *di = dictGetIterator(zs->dict);
         dictEntry *de;
 
+        if (rdbSaveDoubleValue(fp,zs->t) == -1) return -1;
+        if (rdbSaveDoubleValue(fp,zs->dt) == -1) return -1;
+        if (rdbSaveDoubleValue(fp,zs->lambda) == -1) return -1;
         if (rdbSaveLen(fp,dictSize(zs->dict)) == -1) return -1;
         while((de = dictNext(di)) != NULL) {
             robj *eleobj = dictGetEntryKey(de);
@@ -685,9 +688,14 @@ robj *rdbLoadObject(int type, FILE *fp) {
         size_t zsetlen;
         zset *zs;
 
-        if ((zsetlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
         o = createZsetObject();
         zs = o->ptr;
+
+        if (rdbLoadDoubleValue(fp,&zs->t) == REDIS_ERR) return NULL;
+        if (rdbLoadDoubleValue(fp,&zs->dt) == REDIS_ERR) return NULL;
+        if (rdbLoadDoubleValue(fp,&zs->lambda) == REDIS_ERR) return NULL;
+
+        if ((zsetlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
         /* Load every single element of the list/set */
         while(zsetlen--) {
             robj *ele;

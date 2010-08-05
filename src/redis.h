@@ -498,6 +498,15 @@ typedef struct zskiplist {
 typedef struct zset {
     dict *dict;
     zskiplist *zsl;
+
+	/*
+	 * lambda is the halflife relative to the time units
+	 *
+	 * they are part of the equation
+	 * last t is the last time things 
+	 */
+	double lambda, scoredamp;
+	double t, dt;
 } zset;
 
 /* VM threaded I/O request message */
@@ -864,6 +873,8 @@ void strlenCommand(redisClient *c);
 void zrankCommand(redisClient *c);
 void zrevrankCommand(redisClient *c);
 void zsetdCommand(redisClient *c);
+void zinfodCommand(redisClient *c);
+void zsettCommand(redisClient *c);
 void hsetCommand(redisClient *c);
 void hsetnxCommand(redisClient *c);
 void hgetCommand(redisClient *c);
