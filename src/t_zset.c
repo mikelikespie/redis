@@ -315,6 +315,15 @@ zskiplistNode* zslistTypeGetElementByRank(zskiplist *zsl, unsigned long rank) {
     return NULL;
 }
 
+#define zVal(zs, val) ((zs)->lambda == 0.0  \
+								? (val)  \
+								: (val) * exp(-(zs)->lambda * (zs)->dt))
+
+#define zRVal(zs, val) ((zs)->lambda == 0.0  \
+								? (val)  \
+								: (val) / exp(-(zs)->lambda * (zs)->dt))
+								
+
 /*-----------------------------------------------------------------------------
  * Sorted set commands 
  *----------------------------------------------------------------------------*/
@@ -338,6 +347,8 @@ void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, i
         }
     }
     zs = zsetobj->ptr;
+
+	scoreval = zRVal(zs, scoreval);
 
     /* Ok now since we implement both ZADD and ZINCRBY here the code
      * needs to handle the two different conditions. It's all about setting
@@ -377,7 +388,7 @@ void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, i
         touchWatchedKey(c->db,c->argv[1]);
         server.dirty++;
         if (doincrement)
-            addReplyDouble(c,*score);
+            addReplyDouble(c,zVal(zs,*score));
         else
             addReply(c,shared.cone);
     } else {
@@ -404,7 +415,7 @@ void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, i
             zfree(score);
         }
         if (doincrement)
-            addReplyDouble(c,*score);
+            addReplyDouble(c,zVal(zs,*score));
         else
             addReply(c,shared.czero);
     }
@@ -516,19 +527,19 @@ void zremrangebyrankCommand(redisClient *c) {
 void zsetdCommand(redisClient *c) {
     robj *zsetobj, *key;
     zset *zs;
-    double lambda, startTime;
+    double halflife, startTime;
 
     key = c->argv[1];
     if (getDoubleFromObjectOrReply(c, c->argv[2], &startTime, NULL) != REDIS_OK) return;
-    if (getDoubleFromObjectOrReply(c, c->argv[3], &lambda, NULL) != REDIS_OK) return;
+    if (getDoubleFromObjectOrReply(c, c->argv[3], &halflife, NULL) != REDIS_OK) return;
 
     if (isnan(startTime)) {
         addReplySds(c,sdsnew("-ERR provide startTime is Not A Number (nan)\r\n"));
         return;
     }
 
-    if (isnan(lambda)) {
-        addReplySds(c,sdsnew("-ERR provide lambda is Not A Number (nan)\r\n"));
+    if (isnan(halflife)) {
+        addReplySds(c,sdsnew("-ERR provide halflife is Not A Number (nan)\r\n"));
         return;
     }
 
@@ -546,7 +557,7 @@ void zsetdCommand(redisClient *c) {
     zs = zsetobj->ptr;
     zs->t = startTime;
     zs->dt = 0.0;
-    zs->lambda = (float)lambda;
+    zs->lambda = log(2) / halflife;
 
     addReply(c, shared.ok);
 }
@@ -567,8 +578,8 @@ void zinfodCommand(redisClient *c) {
 	addReplyDouble(c,zs->t);
     addReplyBulkCString(c, "dt");
 	addReplyDouble(c,zs->dt);
-    addReplyBulkCString(c, "lambda");
-	addReplyDouble(c,(double)zs->lambda);
+    addReplyBulkCString(c, "halflife");
+	addReplyDouble(c,log(2) / zs->lambda);
 }
 
 void zsettCommand(redisClient *c) {
@@ -867,7 +878,7 @@ void zrangeGenericCommand(redisClient *c, int reverse) {
         ele = ln->obj;
         addReplyBulk(c,ele);
         if (withscores)
-            addReplyDouble(c,ln->score);
+            addReplyDouble(c,zVal(zsetobj, ln->score));
         ln = reverse ? ln->backward : ln->forward[0];
     }
 }
@@ -980,7 +991,7 @@ void genericZrangebyscoreCommand(redisClient *c, int justcount) {
                     ele = ln->obj;
                     addReplyBulk(c,ele);
                     if (withscores)
-                        addReplyDouble(c,ln->score);
+                        addReplyDouble(c,zVal(zsetobj,ln->score));
                 }
                 ln = ln->forward[0];
                 rangelen++;
@@ -1030,7 +1041,7 @@ void zscoreCommand(redisClient *c) {
     } else {
         double *score = dictGetEntryVal(de);
 
-        addReplyDouble(c,*score);
+        addReplyDouble(c,zVal(zs,*score));
     }
 }
 

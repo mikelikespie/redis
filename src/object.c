@@ -94,8 +94,8 @@ robj *createZsetObject(void) {
     zs->zsl = zslCreate();
 
 	/* starts out disabled */
-	zs->lambda = 0.0f;
-	zs->scoredamp = 0.0f;
+	zs->lambda = 0.0;
+	zs->scoredamp = 0.0;
 	zs->t = 0.0;
 	zs->dt = 0.0;
     return createObject(REDIS_ZSET,zs);
