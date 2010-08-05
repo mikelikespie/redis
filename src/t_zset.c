@@ -477,6 +477,8 @@ void zremrangebyscoreCommand(redisClient *c) {
         checkType(c,zsetobj,REDIS_ZSET)) return;
 
     zs = zsetobj->ptr;
+	min = zRVal(zs, min);
+	max = zRVal(zs, max);
     deleted = zslDeleteRangeByScore(zs->zsl,min,max,zs->dict);
     if (htNeedsResize(zs->dict)) dictResize(zs->dict);
     if (dictSize(zs->dict) == 0) dbDelete(c->db,c->argv[1]);
