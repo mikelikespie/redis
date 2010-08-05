@@ -863,6 +863,7 @@ void substrCommand(redisClient *c);
 void strlenCommand(redisClient *c);
 void zrankCommand(redisClient *c);
 void zrevrankCommand(redisClient *c);
+void zsetdCommand(redisClient *c);
 void hsetCommand(redisClient *c);
 void hsetnxCommand(redisClient *c);
 void hgetCommand(redisClient *c);

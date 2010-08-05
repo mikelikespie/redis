@@ -512,6 +512,41 @@ void zremrangebyrankCommand(redisClient *c) {
     server.dirty += deleted;
     addReplyLongLong(c, deleted);
 }
+static void zsetdCommand(redisClient *c) {
+    robj *zsetobj, *key;
+    zset *zs;
+    unsigned long rank;
+    double lambda, startTime;
+
+    key = c->argv[1]
+    if (getDoubleFromObjectOrReply(c, c->argv[2], &startTime, NULL) != REDIS_OK) return;
+    if (getDoubleFromObjectOrReply(c, c->argv[3], &lambda, NULL) != REDIS_OK) return;
+
+    if (isnan(startTime)) {
+        addReplySds(c,sdsnew("-ERR provide startTime is Not A Number (nan)\r\n"));
+        return;
+    }
+
+    if (isnan(lambda)) {
+        addReplySds(c,sdsnew("-ERR provide lambda is Not A Number (nan)\r\n"));
+        return;
+    }
+
+    zsetobj = lookupKeyWrite(c->db,key);
+    if (zsetobj == NULL) {
+        zsetobj = createZsetObject();
+        dbAdd(c->db,key,zsetobj);
+    } else {
+        if (zsetobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+    }
+    zs = zsetobj->ptr;
+    zs->lambda = (float)lambda;
+    zs->t = startTime;
+    zs->dt = 0.0;
+}
 
 typedef struct {
     dict *dict;

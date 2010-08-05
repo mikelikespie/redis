@@ -92,6 +92,12 @@ robj *createZsetObject(void) {
 
     zs->dict = dictCreate(&zsetDictType,NULL);
     zs->zsl = zslCreate();
+
+	/* starts out disabled */
+	zs->lambda = 0.0f;
+	zs->scoredamp = 0.0f;
+	zs->t = 0.0;
+	zs->dt = 0.0;
     return createObject(REDIS_ZSET,zs);
 }
 
